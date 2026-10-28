@@ -2,7 +2,7 @@
 
 An Omarchy bar widget that tells you when an update undoes a PR patch you installed by hand, or when that PR merges.
 
-If you test an open [Omarchy](https://github.com/omacom/omarchy) PR by copying its version of a file over the packaged one (say `/usr/share/omarchy/shell/plugins/lock/LockView.qml`), the next update silently puts the packaged file back and the bug returns. Patchwatch keeps a ledger of those patches and checks them at login, every half hour, and when you open its panel.
+If you test an open [Omarchy](https://github.com/omacom/omarchy) PR by copying its version of a file over the packaged one (say `/usr/share/omarchy/shell/plugins/lock/LockView.qml`), the next update silently puts the packaged file back and the bug returns. Patchwatch keeps a ledger of those patches and checks them when the shell starts, every half hour, and when you open its panel (if the last check is more than a minute old).
 
 ![Patchwatch panel](preview.png)
 
@@ -71,13 +71,13 @@ Each finding uses the same shape as [omarchy-doctor](https://github.com/nixfred/
 
 ## Network, files and privileges
 
-- **Network:** one read-only GitHub API request per tracked PR per check, made by `gh` with your existing sign-in: `GET repos/omacom/omarchy/pulls/<number>`. Nothing else goes out, and nothing is ever posted.
+- **Network:** one read-only GitHub API request per tracked PR per check, made by `gh` with your existing sign-in: `GET repos/omacom/omarchy/pulls/<number>`. **It's fine** and **Copy command** run a check too, to find the finding they act on. Nothing else goes out, and nothing is ever posted.
 - **Reads:** the ledger and acknowledgements below, the tracked package files, and `pacman -Qkk` / `pacman -Qo` output for the `omarchy` and `omarchy-settings` packages.
 - **Writes:** only these, each replaced atomically and never written through a symlink:
   - `~/.config/omarchy-patchwatch/ledger.json` and `patches/` (when you run `add` or `retire`)
   - `~/.local/state/omarchy-patchwatch/acked.json` (when you click **It's fine**)
   - `~/.local/state/omarchy-patchwatch/notified` (only with the optional `--notify` hook below)
-  - Both directories are created with mode 0700 if they don't exist.
+  - Both directories, and `patches/`, are created if missing and set to mode 0700 on every run.
 - **Privileges:** none. Patchwatch never runs `sudo` or edits system files. Restore commands are shown and copied, never executed.
 - **Agent:** the agent button opens your default agent with a fixed prompt. No finding text is put into the prompt; the agent runs the check itself.
 - **Your config:** the plugin does not edit `shell.json`, Hyprland config or hooks.
@@ -88,7 +88,7 @@ Each finding uses the same shape as [omarchy-doctor](https://github.com/nixfred/
 omarchy plugin remove io.github.mudiam.patchwatch
 ```
 
-This removes the widget and the bundled command. Your patch ledger and saved copies in `~/.config/omarchy-patchwatch/` and the acknowledgements in `~/.local/state/omarchy-patchwatch/` are kept, so reinstalling picks up where you left off. Delete those two directories yourself if you don't want them. If you linked the command into `~/.local/bin`, remove that link too.
+This removes the widget and the bundled command. Your patch ledger and saved copies in `~/.config/omarchy-patchwatch/` and the acknowledgements in `~/.local/state/omarchy-patchwatch/` are kept, so reinstalling picks up where you left off. Delete those two directories yourself if you don't want them. If you linked the command into `~/.local/bin`, remove that link too. If you added the optional notification hook below, delete `~/.config/omarchy/hooks/post-update.d/patchwatch.hook` as well; otherwise every update reports it as a failed hook.
 
 ## Optional: a notification after updates
 
