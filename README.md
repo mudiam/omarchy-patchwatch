@@ -17,7 +17,7 @@ If you test an open [Omarchy](https://github.com/omacom/omarchy) PR by copying i
 
 Click the icon to open the panel. Right-click rechecks.
 
-The panel lists each finding with what to do about it. Where a fix is a single command (for example, the `sudo install` line that puts your patched file back), **Copy command** puts it on the clipboard. Patchwatch never runs `sudo` itself. **It's fine** silences a finding until it changes. **Go Through It With My Agent** opens your default agent (`omarchy agent prompt`) with a fixed prompt to work through the findings with you. If that session is still open, clicking again brings it to the front instead of starting another.
+The panel lists each finding with what to do about it. Where a fix is a single command (for example, the `sudo install` line that puts your patched file back), **Copy command** puts it on the clipboard. Patchwatch never runs `sudo` itself. **It's fine** silences a finding until it changes. **Go Through It With My Agent** opens your default agent (`omarchy agent prompt`) with a fixed prompt to work through the findings with you. Clicking again within ten minutes brings that session to the front instead of starting another; after that, a click starts a fresh one.
 
 ## Install
 

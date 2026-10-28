@@ -41,6 +41,7 @@ MAX_DRIFT=50
 MAX_FIELD=600           # characters per finding field
 MAX_PACMAN_BYTES=1048576
 MAX_CLIENTS_BYTES=1048576
+AGENT_REUSE_SECONDS=600   # focus an agent session this recent instead of opening another
 
 die() { echo "omarchy-patchwatch: $*" >&2; exit 1; }
 
@@ -314,11 +315,12 @@ cmd_copy_command() {
 }
 
 # The panel button and the notification both land here, so repeated clicks
-# focus the session already open instead of starting another one. The prompt
+# focus a session opened in the last few minutes instead of starting another.
+# An older one is likely finished with, so a click then starts a fresh one. The prompt
 # is fixed; nothing from the findings is put into it. The agent runs the check
 # itself, in a terminal the user is watching.
 cmd_open_agent() {
-  local marker="check' and go through each finding with me" clients address last now
+  local marker="check' and go through each finding with me" clients address age last now
   # The lock is taken on the state directory itself, so no lock file is
   # created or truncated, and nothing planted at a lock path is written through.
   exec 9<"$STATE_DIR"
@@ -330,6 +332,9 @@ cmd_open_agent() {
     jq -r '.[]? | select(.class == "org.omarchy.agent") | "\(.pid) \(.address)"' 2>/dev/null |
     while read -r pid addr; do
       [[ $pid =~ ^[0-9]+$ ]] || continue
+      age=$(ps -o etimes= -p "$pid" 2>/dev/null) || continue
+      age=${age//[[:space:]]/}
+      [[ $age =~ ^[0-9]+$ ]] && ((age < AGENT_REUSE_SECONDS)) || continue
       if grep -qaF -- "$marker" "/proc/$pid/cmdline" 2>/dev/null; then
         echo "$addr"
         break
@@ -349,8 +354,10 @@ cmd_open_agent() {
   ((now - last >= 15)) || return 0
   printf '%s' "$now" | write_atomic "$AGENT_LAUNCHED"
 
-  # The lock is closed for the agent, or the terminal would hold it open.
-  omarchy-agent-prompt "Run '$SELF $marker. For overwritten patches, help me re-install or re-apply them; for merged PRs, help me re-test on this machine. Don't post anything to GitHub without my approval of the exact text." 9>&-
+  # omarchy-agent-prompt waits for the window to close, so it replaces this
+  # process and the lock is closed first; otherwise every later click would
+  # find the lock taken for as long as the session stays open.
+  exec omarchy-agent-prompt "Run '$SELF $marker. For overwritten patches, help me re-install or re-apply them; for merged PRs, help me re-test on this machine. Don't post anything to GitHub without my approval of the exact text." 9>&-
 }
 
 ensure_dir "$CONFIG_DIR"
