@@ -40,6 +40,7 @@ MAX_PATCHES=64
 MAX_DRIFT=50
 MAX_FIELD=600           # characters per finding field
 MAX_PACMAN_BYTES=1048576
+MAX_CLIENTS_BYTES=1048576
 
 die() { echo "omarchy-patchwatch: $*" >&2; exit 1; }
 
@@ -317,13 +318,18 @@ cmd_copy_command() {
 # is fixed; nothing from the findings is put into it. The agent runs the check
 # itself, in a terminal the user is watching.
 cmd_open_agent() {
-  local marker="check' and go through each finding with me" address last now
-  exec 9>"$STATE_DIR/agent.lock"
+  local marker="check' and go through each finding with me" clients address last now
+  # The lock is taken on the state directory itself, so no lock file is
+  # created or truncated, and nothing planted at a lock path is written through.
+  exec 9<"$STATE_DIR"
   flock -n 9 || return 0
 
-  address=$(hyprctl clients -j 2>/dev/null |
-    jq -r '.[] | select(.class == "org.omarchy.agent") | "\(.pid) \(.address)"' 2>/dev/null |
+  clients=$(hyprctl clients -j 2>/dev/null | head -c $((MAX_CLIENTS_BYTES + 1))) || clients=""
+  ((${#clients} <= MAX_CLIENTS_BYTES)) || clients=""
+  address=$(printf '%s' "$clients" |
+    jq -r '.[]? | select(.class == "org.omarchy.agent") | "\(.pid) \(.address)"' 2>/dev/null |
     while read -r pid addr; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
       if grep -qaF -- "$marker" "/proc/$pid/cmdline" 2>/dev/null; then
         echo "$addr"
         break
