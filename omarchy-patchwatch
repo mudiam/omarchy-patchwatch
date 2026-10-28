@@ -1,0 +1,209 @@
+#!/bin/bash
+
+# omarchy-patchwatch: keep track of PR patches installed over package-owned
+# Omarchy files, and say when an update has replaced one or the PR has merged.
+#
+# Usage:
+#   omarchy-patchwatch check [--json] [--notify]
+#   omarchy-patchwatch add <pr> <file> <patched-copy> [original-copy] [test...]
+#   omarchy-patchwatch ack <key>      # "It's fine": stay quiet until it changes
+#   omarchy-patchwatch retire <key>   # drop a patch from the ledger
+#
+# Findings use the omarchy-doctor shape:
+#   key, state, title, advice, details, command, level (ok|info|warn), signature
+
+set -euo pipefail
+
+# gh comes from mise, which hooks started by Hyprland don't have on PATH.
+export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+
+CONFIG_DIR="$HOME/.config/omarchy-patchwatch"
+LEDGER="$CONFIG_DIR/ledger.json"
+PATCH_DIR="$CONFIG_DIR/patches"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-patchwatch"
+ACKED="$STATE_DIR/acked.json"
+NOTIFIED="$STATE_DIR/notified"
+REPO="omacom/omarchy"
+PACKAGES=(omarchy omarchy-settings)
+
+mkdir -p "$PATCH_DIR" "$STATE_DIR"
+[[ -f $LEDGER ]] || echo '{"patches": []}' >"$LEDGER"
+[[ -f $ACKED ]] || echo '{}' >"$ACKED"
+
+sha() { [[ -r $1 ]] && sha256sum "$1" | cut -d' ' -f1 || echo missing; }
+
+# Prints open, merged, closed or unknown (offline, or gh not signed in).
+pr_state() {
+  local json
+  if json=$(timeout 15 gh api "repos/$REPO/pulls/$1" 2>/dev/null); then
+    jq -r 'if .merged_at then "merged" else .state end' <<<"$json"
+  else
+    echo unknown
+  fi
+}
+
+finding() {
+  jq -nc --arg key "$1" --arg state "$2" --arg title "$3" --arg advice "$4" \
+    --arg details "$5" --arg command "$6" --arg level "$7" --arg signature "$8" \
+    '{key: $key, state: $state, title: $title, advice: $advice, details: $details,
+      command: $command, level: $level, signature: $signature}'
+}
+
+check_patch() {
+  local entry=$1 pr file patched original test mode live want orig_sha state key sig
+  pr=$(jq -r .pr <<<"$entry")
+  file=$(jq -r .file <<<"$entry")
+  patched="$CONFIG_DIR/$(jq -r .patched <<<"$entry")"
+  original=$(jq -r '.original // empty' <<<"$entry")
+  [[ -n $original ]] && original="$CONFIG_DIR/$original"
+  test=$(jq -r '.test // ""' <<<"$entry")
+  mode=$(jq -r '.mode // "644"' <<<"$entry")
+  key="pr$pr:$file"
+
+  live=$(sha "$file")
+  want=$(sha "$patched")
+  orig_sha=$([[ -n $original ]] && sha "$original" || echo none)
+  state=$(pr_state "$pr")
+  sig=$(printf '%s %s' "$live" "$state" | sha256sum | cut -c1-16)
+  local pkg
+  pkg=$(pacman -Qoq "$file" 2>/dev/null | head -1 || true)
+  local version
+  version=$([[ -n $pkg ]] && pacman -Q "$pkg" | cut -d' ' -f2 || true)
+  [[ -n $pkg ]] || pkg="no package"
+
+  if [[ $live == "$want" ]]; then
+    if [[ $state == merged ]]; then
+      finding "$key" merged-and-applied "#$pr merged; your patch is still installed" \
+        "The fix is upstream. The next update replaces your copy with the merged version." \
+        "$file ($pkg $version)" "" info "$sig"
+    else
+      finding "$key" applied "#$pr patch in place" "" "$file ($pkg $version), PR $state" "" ok "$sig"
+    fi
+  elif [[ $state == merged ]]; then
+    finding "$key" merged-retest "#$pr merged and shipped: re-test it on this machine" \
+      "Re-run the test, post the result if useful, then: omarchy-patchwatch retire '$key'.${test:+ Test: $test}" \
+      "$file now comes from $pkg $version" "" info "$sig"
+  elif [[ $live == "$orig_sha" ]]; then
+    finding "$key" overwritten "#$pr patch was overwritten by an update; the bug is back" \
+      "The file is back to the version you patched, so the saved copy can go straight back in." \
+      "$file ($pkg $version), PR $state" "sudo install -m $mode '$patched' '$file'" warn "$sig"
+  elif [[ $live == missing ]]; then
+    finding "$key" missing "#$pr patched file no longer exists" \
+      "The package moved or removed $file. Check where the code went before re-applying #$pr." \
+      "$pkg $version, PR $state" "" warn "$sig"
+  else
+    finding "$key" overwritten-changed "#$pr patch was overwritten, and the file changed upstream" \
+      "Copying the old patch back would undo the upstream changes. Re-apply the PR diff to the new file (ask the agent), then update the saved copy." \
+      "$file ($pkg $version), PR $state" "gh pr diff $pr -R $REPO" warn "$sig"
+  fi
+}
+
+# Package files edited by hand that the ledger doesn't know about.
+check_drift() {
+  local tracked line file
+  tracked=$(jq -r '.patches[].file' "$LEDGER")
+  # pacman exits non-zero whenever it finds a mismatch, and grep when it finds none.
+  { pacman -Qkk "${PACKAGES[@]}" 2>&1 || true; } | { grep -E '\((Size|SHA256 checksum) mismatch\)' || true; } |
+    sed -E 's/^warning: [^:]+: (.*) \(.*\)$/\1/' | sort -u |
+    while read -r file; do
+      grep -qxF "$file" <<<"$tracked" && continue
+      line=$(sha "$file")
+      finding "drift:$file" untracked-edit "Untracked local edit to a package file" \
+        "An update will overwrite this. If it's a PR patch, add it with: omarchy-patchwatch add <pr> '$file' <copy>" \
+        "$file ($(pacman -Qoq "$file" 2>/dev/null))" "" info "${line:0:16}"
+    done
+}
+
+all_findings() {
+  jq -c '.patches[]' "$LEDGER" | while read -r entry; do check_patch "$entry"; done
+  check_drift
+}
+
+cmd_check() {
+  local json=0 notify=0
+  for arg in "$@"; do
+    case $arg in
+    --json) json=1 ;;
+    --notify) notify=1 ;;
+    *) echo "Unknown option: $arg" >&2 && exit 1 ;;
+    esac
+  done
+
+  local findings
+  findings=$(all_findings | jq -s --slurpfile acked "$ACKED" \
+    'map(. + {acked: ($acked[0][.key] == .signature)})')
+
+  if ((json)); then
+    echo "$findings"
+  else
+    jq -r '.[] | "[\(.level)\(if .acked then ", acked" else "" end)] \(.title)\n    \(.details)" +
+      (if .advice != "" then "\n    \(.advice)" else "" end) +
+      (if .command != "" then "\n    $ \(.command)" else "" end)' <<<"$findings"
+  fi
+
+  if ((notify)); then
+    local pending current
+    pending=$(jq '[.[] | select(.level != "ok" and (.acked | not))]' <<<"$findings")
+    current=$(jq -r '[.[].signature] | sort | join(",")' <<<"$pending")
+    # Only speak up when something new is wrong, not on every boot.
+    if [[ -n $current && $current != "$(cat "$NOTIFIED" 2>/dev/null)" ]]; then
+      local warn total
+      warn=$(jq '[.[] | select(.level == "warn")] | length' <<<"$pending")
+      total=$(jq length <<<"$pending")
+      omarchy-notification-send -u "$( ((warn)) && echo critical || echo normal)" -g 󰁨 \
+        "Local patches need a look" \
+        "$total finding(s) after the update. Click to go through them with your agent." \
+        --exec omarchy-agent-prompt "Run 'omarchy-patchwatch check' and go through each finding with me. For overwritten patches, help me re-install or re-apply them; for merged PRs, help me re-test on this machine. Don't post anything to GitHub without my approval of the exact text." ||
+        true
+    fi
+    echo "$current" >"$NOTIFIED"
+  fi
+}
+
+cmd_add() {
+  (($# >= 3)) || { echo "Usage: omarchy-patchwatch add <pr> <file> <patched-copy> [original-copy] [test...]" >&2; exit 1; }
+  local pr=$1 file=$2 patched=$3 original=${4:-} name dir mode
+  shift 3
+  (($#)) && shift
+  name=$(basename "$file")
+  dir="pr$pr"
+  mkdir -p "$PATCH_DIR/$dir"
+  cp "$patched" "$PATCH_DIR/$dir/$name.patched"
+  [[ -n $original ]] && cp "$original" "$PATCH_DIR/$dir/$name.orig"
+  mode=$(stat -c %a "$file")
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson pr "$pr" --arg file "$file" --arg patched "patches/$dir/$name.patched" \
+    --arg original "$([[ -n $original ]] && echo "patches/$dir/$name.orig")" \
+    --arg mode "$mode" --arg test "$*" \
+    '.patches = [.patches[] | select(.file != $file)] + [{pr: $pr, file: $file, patched: $patched,
+       original: (if $original == "" then null else $original end), mode: $mode, test: $test}]' \
+    "$LEDGER" >"$tmp" && mv "$tmp" "$LEDGER"
+  echo "Tracking #$pr: $file"
+}
+
+cmd_ack() {
+  local key=${1:?Usage: omarchy-patchwatch ack <key>} sig tmp
+  sig=$(all_findings | jq -r --arg key "$key" 'select(.key == $key) | .signature')
+  [[ -n $sig ]] || { echo "No finding with key: $key" >&2; exit 1; }
+  tmp=$(mktemp)
+  jq --arg key "$key" --arg sig "$sig" '.[$key] = $sig' "$ACKED" >"$tmp" && mv "$tmp" "$ACKED"
+  echo "Acknowledged $key until it changes"
+}
+
+cmd_retire() {
+  local key=${1:?Usage: omarchy-patchwatch retire <key>} file tmp
+  file=${key#*:}
+  tmp=$(mktemp)
+  jq --arg file "$file" '.patches = [.patches[] | select(.file != $file)]' "$LEDGER" >"$tmp" &&
+    mv "$tmp" "$LEDGER"
+  echo "Stopped tracking $file (saved copies kept in $PATCH_DIR)"
+}
+
+case ${1:-check} in
+check) shift || true; cmd_check "$@" ;;
+add) shift; cmd_add "$@" ;;
+ack) shift; cmd_ack "$@" ;;
+retire) shift; cmd_retire "$@" ;;
+*) sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' && exit 1 ;;
+esac

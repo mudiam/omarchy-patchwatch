@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# Also catch updates made with plain pacman/yay, which skip the post-update hook.
+# Quiet unless something new turned up since the last notification.
+"$HOME/.local/bin/omarchy-patchwatch" check --notify >/dev/null
