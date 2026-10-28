@@ -1,0 +1,324 @@
+#!/usr/bin/bash
+
+# omarchy-patchwatch: keep track of PR patches installed over package-owned
+# Omarchy files, and say when an update has replaced one or the PR has merged.
+#
+# Usage:
+#   omarchy-patchwatch check [--json] [--notify]
+#   omarchy-patchwatch add <pr> <file> <patched-copy> [original-copy] [test...]
+#   omarchy-patchwatch ack <key>            # "It's fine": stay quiet until it changes
+#   omarchy-patchwatch retire <key>         # drop a patch from the ledger
+#   omarchy-patchwatch copy-command <key>   # put a finding's command on the clipboard
+#
+# Findings use the omarchy-doctor shape:
+#   key, state, title, advice, details, command, level (ok|info|warn), signature
+
+set -euo pipefail
+shopt -s inherit_errexit
+umask 077
+export LC_ALL=C
+
+# System tools resolve from the system directories first. gh may come from a
+# version manager such as mise, which shells started by Hyprland don't have on
+# PATH, so its shims go last. gh is only ever used read-only, for PR state.
+export PATH="/usr/local/bin:/usr/bin:${PATH:-}:$HOME/.local/share/mise/shims"
+
+SELF=$(readlink -f -- "$0")
+CONFIG_DIR="$HOME/.config/omarchy-patchwatch"
+LEDGER="$CONFIG_DIR/ledger.json"
+PATCH_DIR="$CONFIG_DIR/patches"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-patchwatch"
+ACKED="$STATE_DIR/acked.json"
+NOTIFIED="$STATE_DIR/notified"
+REPO="omacom/omarchy"
+PACKAGES=(omarchy omarchy-settings)
+
+MAX_FILE_BYTES=262144   # ledger and acked state
+MAX_PATCHES=64
+MAX_DRIFT=50
+MAX_FIELD=600           # characters per finding field
+MAX_PACMAN_BYTES=1048576
+
+die() { echo "omarchy-patchwatch: $*" >&2; exit 1; }
+
+# A directory of ours, refused rather than repaired if something else is there.
+ensure_dir() {
+  mkdir -p -m 700 -- "$1"
+  [[ -d $1 && ! -L $1 && -O $1 ]] || die "refusing $1: not a directory owned by you"
+  chmod 700 -- "$1"
+}
+
+# Prints a file of ours, at most $2 bytes, without following a symlink or
+# blocking on a FIFO. Absent prints nothing; anything else unusual is an error.
+read_capped() {
+  local file=$1 max=$2 data
+  [[ -e $file || -L $file ]] || return 0
+  [[ -f $file && ! -L $file && -O $file ]] || die "refusing $file: not a regular file owned by you"
+  data=$(dd if="$file" iflag=nofollow,nonblock,count_bytes,fullblock bs=65536 count=$((max + 1)) status=none) ||
+    die "cannot read $file"
+  ((${#data} <= max)) || die "$file is larger than $max bytes"
+  printf '%s' "$data"
+}
+
+# Replaces $1 with stdin through a fresh temporary in the same directory, so a
+# symlink planted at $1 is replaced instead of written through.
+write_atomic() {
+  local dest=$1 tmp
+  tmp=$(mktemp -p "$(dirname -- "$dest")" ".$(basename -- "$dest").XXXXXXXXXX")
+  if cat >"$tmp" && mv -f -T -- "$tmp" "$dest"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  die "cannot write $dest"
+}
+
+sha() { [[ -f $1 && -r $1 ]] && sha256sum -- "$1" | cut -d' ' -f1 || echo missing; }
+
+# A copy we saved ourselves must still be a plain file of ours.
+saved_sha() { [[ -f $1 && ! -L $1 && -O $1 ]] && sha "$1" || echo missing; }
+
+# Prints open, merged, closed or unknown (offline, or gh missing or signed out).
+pr_state() {
+  local state
+  state=$(timeout -k 2 15 gh api "repos/$REPO/pulls/$1" \
+    --jq 'if .merged_at then "merged" else .state end' 2>/dev/null | head -c 16) || true
+  [[ $state =~ ^(open|closed|merged)$ ]] && echo "$state" || echo unknown
+}
+
+finding() {
+  jq -nc --argjson max "$MAX_FIELD" \
+    --arg key "$1" --arg state "$2" --arg title "$3" --arg advice "$4" \
+    --arg details "$5" --arg command "$6" --arg level "$7" --arg signature "$8" \
+    'def cap: if length > $max then .[:$max] else . end;
+     {key: ($key | cap), state: $state, title: ($title | cap), advice: ($advice | cap),
+      details: ($details | cap), command: ($command | cap), level: $level, signature: $signature}'
+}
+
+# The ledger, checked against the shape `add` writes. Anything else is refused
+# whole: a field that later becomes part of a displayed command must not be
+# trusted just because the file is ours.
+load_ledger() {
+  local raw
+  # Explicit: callers test this function in an `if`, where set -e is off.
+  raw=$(read_capped "$LEDGER" "$MAX_FILE_BYTES") || return 1
+  [[ -n $raw ]] || raw='{"patches": []}'
+  jq -c --argjson max "$MAX_PATCHES" '
+    def safe_path: type == "string" and length < 4096 and test("^/[^\u0000-\u001f\u007f]*$");
+    def saved: type == "string" and test("^patches/pr[0-9]{1,7}/[A-Za-z0-9._-]{1,128}$");
+    if (.patches | type) == "array" and (.patches | length) <= $max and all(.patches[];
+         type == "object"
+         and (.pr | type == "number" and . == floor and . > 0 and . < 10000000)
+         and (.file | safe_path)
+         and (.patched | saved)
+         and (.original == null or (.original | saved))
+         and (.mode | type == "string" and test("^[0-7]{3,4}$"))
+         and ((.test // "") | type == "string" and length <= 500))
+    then . else error("invalid ledger") end' <<<"$raw" 2>/dev/null ||
+    die "$LEDGER does not have the expected shape"
+}
+
+load_acked() {
+  local raw
+  # Unreadable acknowledgements just mean nothing is acknowledged.
+  raw=$(read_capped "$ACKED" "$MAX_FILE_BYTES" 2>/dev/null) || raw='{}'
+  [[ -n $raw ]] || raw='{}'
+  jq -c 'if type == "object" and length <= 500 and all(.[]; type == "string") then . else {} end' \
+    <<<"$raw" 2>/dev/null || echo '{}'
+}
+
+check_patch() {
+  local entry=$1 pr file patched original test mode live want orig_sha state key sig pkg version restore
+  pr=$(jq -r .pr <<<"$entry")
+  file=$(jq -r .file <<<"$entry")
+  patched="$CONFIG_DIR/$(jq -r .patched <<<"$entry")"
+  original=$(jq -r '.original // empty' <<<"$entry")
+  [[ -n $original ]] && original="$CONFIG_DIR/$original"
+  test=$(jq -r '.test // ""' <<<"$entry")
+  mode=$(jq -r .mode <<<"$entry")
+  key="pr$pr:$file"
+
+  live=$(sha "$file")
+  want=$(saved_sha "$patched")
+  orig_sha=$([[ -n $original ]] && saved_sha "$original" || echo none)
+  state=$(pr_state "$pr")
+  sig=$(printf '%s %s' "$live" "$state" | sha256sum | cut -c1-16)
+  pkg=$(pacman -Qoq -- "$file" 2>/dev/null | head -n 1 || true)
+  version=$([[ -n $pkg ]] && pacman -Q -- "$pkg" 2>/dev/null | cut -d' ' -f2 || true)
+  [[ -n $pkg ]] || pkg="no package"
+  printf -v restore 'sudo install -m %s -- %q %q' "$mode" "$patched" "$file"
+
+  if [[ $want == missing ]]; then
+    finding "$key" copy-missing "#$pr saved copy is missing" \
+      "The patched copy under $CONFIG_DIR is gone, so it can't be compared or restored. Add the patch again." \
+      "$file ($pkg $version)" "" warn "$sig"
+  elif [[ $live == "$want" ]]; then
+    if [[ $state == merged ]]; then
+      finding "$key" merged-and-applied "#$pr merged; your patch is still installed" \
+        "The fix is upstream. The next update replaces your copy with the merged version." \
+        "$file ($pkg $version)" "" info "$sig"
+    else
+      finding "$key" applied "#$pr patch in place" "" "$file ($pkg $version), PR $state" "" ok "$sig"
+    fi
+  elif [[ $state == merged ]]; then
+    finding "$key" merged-retest "#$pr merged and shipped: re-test it on this machine" \
+      "Re-run the test, post the result if useful, then retire it.${test:+ Test: $test}" \
+      "$file now comes from $pkg $version" "" info "$sig"
+  elif [[ $live == "$orig_sha" ]]; then
+    finding "$key" overwritten "#$pr patch was overwritten by an update; the bug is back" \
+      "The file is back to the version you patched, so the saved copy can go straight back in." \
+      "$file ($pkg $version), PR $state" "$restore" warn "$sig"
+  elif [[ $live == missing ]]; then
+    finding "$key" missing "#$pr patched file no longer exists" \
+      "The package moved or removed $file. Check where the code went before re-applying #$pr." \
+      "$pkg $version, PR $state" "" warn "$sig"
+  else
+    finding "$key" overwritten-changed "#$pr patch was overwritten, and the file changed upstream" \
+      "Copying the old patch back would undo the upstream changes. Re-apply the PR diff to the new file, then add the patch again." \
+      "$file ($pkg $version), PR $state" "gh pr diff $pr -R $REPO" warn "$sig"
+  fi
+}
+
+# Package files edited by hand that the ledger doesn't know about.
+check_drift() {
+  local tracked=$1 file
+  # pacman exits non-zero whenever it finds a mismatch, and grep when it finds none.
+  { pacman -Qkk -- "${PACKAGES[@]}" 2>&1 || true; } | head -c "$MAX_PACMAN_BYTES" |
+    { grep -E '\((Size|SHA256 checksum) mismatch\)' || true; } |
+    sed -E 's/^warning: [^:]+: (.*) \(.*\)$/\1/' | sort -u | head -n "$MAX_DRIFT" |
+    while IFS= read -r file; do
+      grep -qxF -- "$file" <<<"$tracked" && continue
+      finding "drift:$file" untracked-edit "Untracked local edit to a package file" \
+        "An update will overwrite this. If it's a PR patch, track it with 'omarchy-patchwatch add'." \
+        "$file ($(pacman -Qoq -- "$file" 2>/dev/null | head -n 1))" "" info "$(sha "$file" | cut -c1-16)"
+    done
+}
+
+all_findings() {
+  local ledger
+  if ! ledger=$(load_ledger 2>/dev/null); then
+    finding "ledger" ledger-invalid "The patch ledger can't be read" \
+      "$LEDGER is not a regular file of yours, is too large, or doesn't have the shape 'add' writes. Patches are not being checked." \
+      "$LEDGER" "" warn "$(sha "$LEDGER" | cut -c1-16)"
+    ledger='{"patches": []}'
+  fi
+  jq -c '.patches[]' <<<"$ledger" | while IFS= read -r entry; do check_patch "$entry"; done
+  check_drift "$(jq -r '.patches[].file' <<<"$ledger")"
+}
+
+cmd_check() {
+  local json=0 notify=0 findings acked
+  for arg in "$@"; do
+    case $arg in
+    --json) json=1 ;;
+    --notify) notify=1 ;;
+    *) die "unknown option: $arg" ;;
+    esac
+  done
+
+  acked=$(load_acked)
+  findings=$(all_findings | jq -s --argjson acked "$acked" \
+    'map(. + {acked: ($acked[.key] == .signature)}) | .[:200]')
+
+  if ((json)); then
+    echo "$findings"
+  else
+    jq -r '.[] | "[\(.level)\(if .acked then ", acked" else "" end)] \(.title)\n    \(.details)" +
+      (if .advice != "" then "\n    \(.advice)" else "" end) +
+      (if .command != "" then "\n    $ \(.command)" else "" end)' <<<"$findings"
+  fi
+
+  if ((notify)); then
+    local pending current previous warn total
+    pending=$(jq '[.[] | select(.level != "ok" and (.acked | not))]' <<<"$findings")
+    current=$(jq -r '[.[].signature] | sort | join(",")' <<<"$pending")
+    # Unreadable state means nothing was notified yet; write_atomic replaces it.
+    previous=$(read_capped "$NOTIFIED" 65536 2>/dev/null) || previous=""
+    # Only speak up when something new is wrong, not on every boot.
+    if [[ -n $current && $current != "$previous" ]]; then
+      warn=$(jq '[.[] | select(.level == "warn")] | length' <<<"$pending")
+      total=$(jq length <<<"$pending")
+      omarchy-notification-send -u "$( ((warn)) && echo critical || echo normal)" -g 󰁨 \
+        "Local patches need a look" \
+        "$total finding(s) after the update. Click to go through them with your agent." \
+        --exec omarchy-agent-prompt "Run '$SELF check' and go through each finding with me. For overwritten patches, help me re-install or re-apply them; for merged PRs, help me re-test on this machine. Don't post anything to GitHub without my approval of the exact text." ||
+        true
+    fi
+    printf '%s' "$current" | write_atomic "$NOTIFIED"
+  fi
+}
+
+cmd_add() {
+  (($# >= 3)) || die "usage: omarchy-patchwatch add <pr> <file> <patched-copy> [original-copy] [test...]"
+  local pr=$1 file=$2 patched=$3 original=${4:-} name dir mode ledger
+  shift 3
+  (($#)) && shift
+
+  [[ $pr =~ ^[1-9][0-9]{0,6}$ ]] || die "PR must be a number"
+  [[ $file == /* && $file != *$'\n'* ]] || die "file must be an absolute path"
+  [[ -f $file ]] || die "$file is not a regular file"
+  [[ -f $patched ]] || die "$patched is not a regular file"
+  [[ -z $original || -f $original ]] || die "$original is not a regular file"
+  name=$(basename -- "$file")
+  [[ $name =~ ^[A-Za-z0-9._-]{1,128}$ && $name != . && $name != .. ]] || die "unsupported file name: $name"
+  (($(wc -c <<<"$*") <= 500)) || die "test note is longer than 500 characters"
+
+  ledger=$(load_ledger)
+  dir="pr$pr"
+  ensure_dir "$PATCH_DIR/$dir"
+  write_atomic "$PATCH_DIR/$dir/$name.patched" <"$patched"
+  [[ -n $original ]] && write_atomic "$PATCH_DIR/$dir/$name.orig" <"$original"
+  mode=$(stat -c %a -- "$file")
+
+  jq --argjson pr "$pr" --arg file "$file" --arg patched "patches/$dir/$name.patched" \
+    --arg original "$([[ -n $original ]] && echo "patches/$dir/$name.orig")" \
+    --arg mode "$mode" --arg test "$*" \
+    '.patches = [.patches[] | select(.file != $file)] + [{pr: $pr, file: $file, patched: $patched,
+       original: (if $original == "" then null else $original end), mode: $mode, test: $test}]' \
+    <<<"$ledger" | write_atomic "$LEDGER"
+  load_ledger >/dev/null
+  echo "Tracking #$pr: $file"
+}
+
+find_key() {
+  local key=$1
+  [[ ${#key} -le 4200 && $key != *$'\n'* ]] || die "invalid key"
+  all_findings | jq -c --arg key "$key" 'select(.key == $key)' | head -n 1
+}
+
+cmd_ack() {
+  local key=${1:?usage: omarchy-patchwatch ack <key>} match
+  match=$(find_key "$key")
+  [[ -n $match ]] || die "no finding with key: $key"
+  load_acked | jq --arg key "$key" --arg sig "$(jq -r .signature <<<"$match")" '.[$key] = $sig' |
+    write_atomic "$ACKED"
+  echo "Acknowledged $key until it changes"
+}
+
+cmd_retire() {
+  local key=${1:?usage: omarchy-patchwatch retire <key>} file
+  [[ $key =~ ^pr[0-9]+:/ && $key != *$'\n'* ]] || die "not a patch key: $key"
+  file=${key#*:}
+  load_ledger | jq --arg file "$file" '.patches = [.patches[] | select(.file != $file)]' |
+    write_atomic "$LEDGER"
+  echo "Stopped tracking $file (saved copies kept in $PATCH_DIR)"
+}
+
+cmd_copy_command() {
+  local key=${1:?usage: omarchy-patchwatch copy-command <key>} command
+  command=$(find_key "$key" | jq -r '.command // empty')
+  [[ -n $command ]] || die "no command for: $key"
+  printf '%s' "$command" | wl-copy
+}
+
+ensure_dir "$CONFIG_DIR"
+ensure_dir "$PATCH_DIR"
+ensure_dir "$STATE_DIR"
+
+case ${1:-check} in
+check) shift || true; cmd_check "$@" ;;
+add) shift; cmd_add "$@" ;;
+ack) shift; cmd_ack "$@" ;;
+retire) shift; cmd_retire "$@" ;;
+copy-command) shift; cmd_copy_command "$@" ;;
+*) sed -n '3,15p' "$SELF" | sed 's/^# \{0,1\}//' && exit 1 ;;
+esac

@@ -1,4 +1,0 @@
-#!/bin/bash
-
-# Say when the update replaced a locally installed PR patch, or a tracked PR merged.
-"$HOME/.local/bin/omarchy-patchwatch" check --notify >/dev/null

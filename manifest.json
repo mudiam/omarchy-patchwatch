@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mudiam.patchwatch",
+  "name": "Patchwatch",
+  "version": "1.0.0",
+  "author": "mudiam",
+  "description": "Tells you when an Omarchy update undoes a PR patch you installed by hand, or when that PR merges",
+  "homepage": "https://github.com/mudiam/omarchy-patchwatch",
+  "license": "MIT",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Patchwatch",
+    "description": "Tracks PR patches installed over Omarchy's own files and flags the ones an update undid",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
