@@ -10,6 +10,7 @@
 #   omarchy-patchwatch retire <key>         # drop a patch from the ledger
 #   omarchy-patchwatch copy-command <key>   # put a finding's command on the clipboard
 #   omarchy-patchwatch open-agent           # go through the findings with your agent
+#   omarchy-patchwatch ack-signatures <sig>...  # "It's fine" for the findings a notification listed
 #
 # Findings use the omarchy-doctor shape:
 #   key, state, title, advice, details, command, level (ok|info|warn), signature
@@ -232,7 +233,7 @@ cmd_check() {
   fi
 
   if ((notify)); then
-    local pending current previous warn total
+    local pending current previous warn total sigs actions
     pending=$(jq '[.[] | select(.level != "ok" and (.acked | not))]' <<<"$findings")
     current=$(jq -r '[.[].signature] | sort | join(",")' <<<"$pending")
     # Unreadable state means nothing was notified yet; write_atomic replaces it.
@@ -241,10 +242,16 @@ cmd_check() {
     if [[ -n $current && $current != "$previous" ]]; then
       warn=$(jq '[.[] | select(.level == "warn")] | length' <<<"$pending")
       total=$(jq length <<<"$pending")
+      # The first action is also what a click on the card runs. "It's Fine"
+      # carries the signatures this card announced, so it can only silence
+      # findings as they were shown; one that changes since gets a new one.
+      actions=(--action "Go Through It" "$SELF" open-agent)
+      mapfile -t sigs < <(jq -r '.[].signature | select(test("^[0-9a-f]{16}$"))' <<<"$pending")
+      ((${#sigs[@]})) && actions+=(--action "It's Fine" "$SELF" ack-signatures "${sigs[@]}")
       omarchy-notification-send -u "$( ((warn)) && echo critical || echo normal)" -g 󰁨 \
         "Local patches need a look" \
         "$total finding(s) after the update. Click to go through them with your agent." \
-        --exec "$SELF" open-agent ||
+        "${actions[@]}" ||
         true
     fi
     printf '%s' "$current" | write_atomic "$NOTIFIED"
@@ -296,6 +303,21 @@ cmd_ack() {
   load_acked | jq --arg key "$key" --arg sig "$(jq -r .signature <<<"$match")" '.[$key] = $sig' |
     write_atomic "$ACKED"
   echo "Acknowledged $key until it changes"
+}
+
+# The notification's "It's Fine" button. Only pending findings whose signature
+# is still one of these are acknowledged, so a stale button does nothing.
+cmd_ack_signatures() {
+  (($# > 0 && $# <= MAX_PATCHES + MAX_DRIFT + 1)) || die "usage: omarchy-patchwatch ack-signatures <sig>..."
+  local sig sigs matches
+  for sig in "$@"; do
+    [[ $sig =~ ^[0-9a-f]{16}$ ]] || die "invalid signature: $sig"
+  done
+  sigs=$(printf '%s\n' "$@" | jq -R . | jq -sc .)
+  matches=$(all_findings | jq -sc --argjson sigs "$sigs" \
+    'map(select(.level != "ok" and (.signature | IN($sigs[])))) | map({(.key): .signature}) | add // {}')
+  load_acked | jq --argjson matches "$matches" '. + $matches' | write_atomic "$ACKED"
+  echo "Acknowledged $(jq length <<<"$matches") finding(s) until they change"
 }
 
 cmd_retire() {
@@ -368,8 +390,9 @@ case ${1:-check} in
 check) shift || true; cmd_check "$@" ;;
 add) shift; cmd_add "$@" ;;
 ack) shift; cmd_ack "$@" ;;
+ack-signatures) shift; cmd_ack_signatures "$@" ;;
 retire) shift; cmd_retire "$@" ;;
 copy-command) shift; cmd_copy_command "$@" ;;
 open-agent) cmd_open_agent ;;
-*) sed -n '3,16p' "$SELF" | sed 's/^# \{0,1\}//' && exit 1 ;;
+*) sed -n '3,17p' "$SELF" | sed 's/^# \{0,1\}//' && exit 1 ;;
 esac

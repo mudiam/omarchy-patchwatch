@@ -101,7 +101,7 @@ cat > ~/.config/omarchy/hooks/post-update.d/patchwatch.hook <<'EOF'
 EOF
 ```
 
-It notifies only when the set of findings changes, and clicking the notification opens your agent the same way the panel button does. Remove the hook file to turn it off.
+It notifies only when the set of findings changes. Clicking the notification, or its **Go Through It** button, opens your agent the same way the panel button does. **It's Fine** silences the findings that notification listed until they change, like the panel's button does for one. The buttons need Omarchy 4.5 or later. Remove the hook file to turn it off.
 
 ## Background
 
