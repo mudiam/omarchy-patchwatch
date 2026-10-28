@@ -9,6 +9,7 @@
 #   omarchy-patchwatch ack <key>            # "It's fine": stay quiet until it changes
 #   omarchy-patchwatch retire <key>         # drop a patch from the ledger
 #   omarchy-patchwatch copy-command <key>   # put a finding's command on the clipboard
+#   omarchy-patchwatch open-agent           # go through the findings with your agent
 #
 # Findings use the omarchy-doctor shape:
 #   key, state, title, advice, details, command, level (ok|info|warn), signature
@@ -30,6 +31,7 @@ PATCH_DIR="$CONFIG_DIR/patches"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-patchwatch"
 ACKED="$STATE_DIR/acked.json"
 NOTIFIED="$STATE_DIR/notified"
+AGENT_LAUNCHED="$STATE_DIR/agent-launched"
 REPO="omacom/omarchy"
 PACKAGES=(omarchy omarchy-settings)
 
@@ -240,7 +242,7 @@ cmd_check() {
       omarchy-notification-send -u "$( ((warn)) && echo critical || echo normal)" -g 󰁨 \
         "Local patches need a look" \
         "$total finding(s) after the update. Click to go through them with your agent." \
-        --exec omarchy-agent-prompt "Run '$SELF check' and go through each finding with me. For overwritten patches, help me re-install or re-apply them; for merged PRs, help me re-test on this machine. Don't post anything to GitHub without my approval of the exact text." ||
+        --exec "$SELF" open-agent ||
         true
     fi
     printf '%s' "$current" | write_atomic "$NOTIFIED"
@@ -310,6 +312,41 @@ cmd_copy_command() {
   printf '%s' "$command" | wl-copy
 }
 
+# The panel button and the notification both land here, so repeated clicks
+# focus the session already open instead of starting another one. The prompt
+# is fixed; nothing from the findings is put into it. The agent runs the check
+# itself, in a terminal the user is watching.
+cmd_open_agent() {
+  local marker="check' and go through each finding with me" address last now
+  exec 9>"$STATE_DIR/agent.lock"
+  flock -n 9 || return 0
+
+  address=$(hyprctl clients -j 2>/dev/null |
+    jq -r '.[] | select(.class == "org.omarchy.agent") | "\(.pid) \(.address)"' 2>/dev/null |
+    while read -r pid addr; do
+      if grep -qaF -- "$marker" "/proc/$pid/cmdline" 2>/dev/null; then
+        echo "$addr"
+        break
+      fi
+    done) || true
+  if [[ $address =~ ^0x[0-9a-f]+$ ]]; then
+    # Lua dispatch first (Hyprland 0.56 and later), the old dispatcher otherwise.
+    hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" >/dev/null 2>&1 ||
+      hyprctl dispatch focuswindow "address:$address" >/dev/null || true
+    return 0
+  fi
+
+  # The window takes a moment to appear, so a launch this recent is still on its way.
+  now=$(date +%s)
+  last=$(read_capped "$AGENT_LAUNCHED" 32 2>/dev/null) || last=0
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  ((now - last >= 15)) || return 0
+  printf '%s' "$now" | write_atomic "$AGENT_LAUNCHED"
+
+  # The lock is closed for the agent, or the terminal would hold it open.
+  omarchy-agent-prompt "Run '$SELF $marker. For overwritten patches, help me re-install or re-apply them; for merged PRs, help me re-test on this machine. Don't post anything to GitHub without my approval of the exact text." 9>&-
+}
+
 ensure_dir "$CONFIG_DIR"
 ensure_dir "$PATCH_DIR"
 ensure_dir "$STATE_DIR"
@@ -320,5 +357,6 @@ add) shift; cmd_add "$@" ;;
 ack) shift; cmd_ack "$@" ;;
 retire) shift; cmd_retire "$@" ;;
 copy-command) shift; cmd_copy_command "$@" ;;
-*) sed -n '3,15p' "$SELF" | sed 's/^# \{0,1\}//' && exit 1 ;;
+open-agent) cmd_open_agent ;;
+*) sed -n '3,16p' "$SELF" | sed 's/^# \{0,1\}//' && exit 1 ;;
 esac

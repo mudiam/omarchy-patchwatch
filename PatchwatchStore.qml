@@ -190,14 +190,10 @@ Singleton {
     actionDeadline.restart()
   }
 
-  // A fixed prompt; nothing from the findings is put into it. The agent runs
-  // the check itself, in a terminal the user is watching.
+  // The CLI owns the prompt, and focuses a session already open rather than
+  // starting a second one.
   function openAgent() {
-    Quickshell.execDetached(["/usr/bin/omarchy-agent-prompt",
-      "Run '" + root.cli + " check' and go through each finding with me. "
-      + "For overwritten patches, help me re-install or re-apply them; for merged PRs, "
-      + "help me re-test on this machine. Don't post anything to GitHub without my "
-      + "approval of the exact text."])
+    Quickshell.execDetached(["/usr/bin/bash", root.cli, "open-agent"])
   }
 
   function openReadme() {
