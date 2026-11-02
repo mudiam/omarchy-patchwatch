@@ -63,6 +63,7 @@ If you'd like the command on your `PATH`, link it: `ln -s ~/.config/omarchy/plug
 | missing | warn | The packaged file no longer exists. |
 | saved copy missing | warn | The patched copy under `~/.config/omarchy-patchwatch/patches/` is gone. |
 | ledger can't be read | warn | `ledger.json` isn't a regular file of yours, is over 256 KiB, or isn't in the shape `add` writes. Nothing is checked until it's fixed. |
+| PR merged, not shipped yet | warn | The PR merged, but your installed release still has the original file (for example, an RC that didn't backport it). The command restores your patch. |
 | PR merged and shipped | info | The fix is upstream. Re-test on your hardware, then retire it. |
 | merged, patch still installed | info | The PR merged but your copy is still in place; the next update replaces it. |
 | untracked local edit | info | `pacman -Qkk omarchy omarchy-settings` reports a size or checksum change to a file the ledger doesn't know about. |

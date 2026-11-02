@@ -164,6 +164,12 @@ check_patch() {
     else
       finding "$key" applied "#$pr patch in place" "" "$file ($pkg $version), PR $state" "" ok "$sig"
     fi
+  elif [[ $state == merged && $live == "$orig_sha" ]]; then
+    # Merged on the default branch but not in the release installed here
+    # (e.g. an RC cut from a branch the fix wasn't backported to).
+    finding "$key" merged-not-shipped "#$pr merged, but your release still ships the old file; the bug is back" \
+      "The fix isn't in $pkg $version yet. Put your saved copy back until a release includes it." \
+      "$file ($pkg $version)" "$restore" warn "$sig"
   elif [[ $state == merged ]]; then
     finding "$key" merged-retest "#$pr merged and shipped: re-test it on this machine" \
       "Re-run the test, post the result if useful, then retire it.${test:+ Test: $test}" \
