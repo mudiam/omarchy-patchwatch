@@ -82,6 +82,17 @@ sha() { [[ -f $1 && -r $1 ]] && sha256sum -- "$1" | cut -d' ' -f1 || echo missin
 # A copy we saved ourselves must still be a plain file of ours.
 saved_sha() { [[ -f $1 && ! -L $1 && -O $1 ]] && sha "$1" || echo missing; }
 
+# The checksum pacman recorded for a file in an installed package, read from
+# the package's mtree (world-readable, so no sudo). Empty if not recorded.
+pkg_sha() {
+  local file=$1 pkg=$2 version=$3 mtree="/var/lib/pacman/local/$2-$3/mtree"
+  [[ -r $mtree ]] || return 0
+  { zcat -- "$mtree" 2>/dev/null || true; } | head -c "$MAX_PACMAN_BYTES" |
+    awk -v p="./${file#/}" '$1 == p {
+      for (i = 2; i <= NF; i++) if ($i ~ /^sha256digest=/) { sub(/^sha256digest=/, "", $i); print $i; exit }
+    }'
+}
+
 # Prints open, merged, closed or unknown (offline, or gh missing or signed out).
 pr_state() {
   local state
@@ -157,7 +168,13 @@ check_patch() {
       "The patched copy under $CONFIG_DIR is gone, so it can't be compared or restored. Add the patch again." \
       "$file ($pkg $version)" "" warn "$sig"
   elif [[ $live == "$want" ]]; then
-    if [[ $state == merged ]]; then
+    if [[ $state == merged && -n $version && $live == "$(pkg_sha "$file" "$pkg" "$version")" ]]; then
+      # The installed package itself now ships this exact file, so the
+      # live copy is stock: the fix has shipped and the patch can retire.
+      finding "$key" merged-retest "#$pr merged and shipped: re-test it on this machine" \
+        "$pkg $version ships the same file as your patch. Re-run the test, post the result if useful, then retire it.${test:+ Test: $test}" \
+        "$file now comes from $pkg $version" "" info "$sig"
+    elif [[ $state == merged ]]; then
       finding "$key" merged-and-applied "#$pr merged; your patch is still installed" \
         "The fix is upstream. The next update replaces your copy with the merged version." \
         "$file ($pkg $version)" "" info "$sig"
